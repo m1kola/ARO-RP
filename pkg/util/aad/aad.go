@@ -9,6 +9,9 @@ import (
 	"strings"
 	"time"
 
+	azgraphrbac "github.com/Azure/azure-sdk-for-go/services/graphrbac/1.6/graphrbac"
+
+	"github.com/Azure/go-autorest/autorest"
 	"github.com/Azure/go-autorest/autorest/adal"
 	"github.com/Azure/go-autorest/autorest/azure/auth"
 	"github.com/dgrijalva/jwt-go"
@@ -16,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 
 	"github.com/Azure/ARO-RP/pkg/api"
+	"github.com/Azure/ARO-RP/pkg/util/azureclient/graphrbac"
 )
 
 // GetToken authenticates in the customer's tenant as the cluster service
@@ -96,4 +100,42 @@ func GetToken(ctx context.Context, log *logrus.Entry, oc *api.OpenShiftCluster, 
 	}
 
 	return token, nil
+}
+
+// GetClusterSPObjectID returns a service principal objectID for a cluster.
+// It retries in case of Authorization_IdentityNotFound error as it is likely due to AAD sync delay.
+func GetClusterSPObjectID(ctx context.Context, log *logrus.Entry, oc *api.OpenShiftCluster, token *adal.ServicePrincipalToken) (string, error) {
+	spp := &oc.Properties.ServicePrincipalProfile
+
+	spGraphAuthorizer := autorest.NewBearerAuthorizer(token)
+	applications := graphrbac.NewApplicationsClient(spp.TenantID, spGraphAuthorizer)
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+	defer cancel()
+
+	var clusterSPObjectID string
+	var err error
+	// NOTE: Do not override err with the error returned by wait.PollImmediateUntil.
+	// Doing this will not propagate the latest error to the user in case when wait exceeds the timeout
+	wait.PollImmediateUntil(10*time.Second, func() (bool, error) {
+		var res azgraphrbac.ServicePrincipalObjectResult
+		res, err = applications.GetServicePrincipalsIDByAppID(ctx, spp.ClientID)
+		if err != nil {
+			log.Info(err)
+
+			if strings.Contains(err.Error(), "Authorization_IdentityNotFound") {
+				return false, nil
+			}
+
+			return false, err
+		}
+
+		clusterSPObjectID = *res.Value
+		return true, nil
+	}, timeoutCtx.Done())
+	if err != nil {
+		return "", err
+	}
+
+	return clusterSPObjectID, nil
 }
